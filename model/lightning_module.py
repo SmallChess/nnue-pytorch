@@ -1,56 +1,226 @@
 import lightning as L
-import ranger21
 import torch
+
 from torch import Tensor, nn
+from torchmetrics import MeanMetric, MetricCollection
 
-from .config import LossParams, ModelConfig
-from .features import FeatureSet
+from .config import NNUELightningConfig
 from .model import NNUEModel
+from .lambda_utils import LambdaController
 
 
-def _get_parameters(layers: list[nn.Module]):
-    return [p for layer in layers for p in layer.parameters()]
+def _get_parameters(layers: list[nn.Module], get_biases: bool = False):
+    return [
+        p
+        for layer in layers
+        for name, p in layer.named_parameters()
+        if ("bias" in name) == get_biases and p.requires_grad
+    ]
+
+
+def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
+    # convert the network and search scores to an estimate match result
+    # based on the win_rate_model, with scalings and offsets optimized
+    q = (scorenet - loss_params.in_offset) / loss_params.in_scaling
+    qm = (-scorenet - loss_params.in_offset) / loss_params.in_scaling
+    qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
+
+    s = (score - loss_params.out_offset) / loss_params.out_scaling
+    sm = (-score - loss_params.out_offset) / loss_params.out_scaling
+    pf = 0.5 * (1.0 + s.sigmoid() - sm.sigmoid())
+
+    # blend that eval based score with the actual game outcome
+    t = outcome
+
+    pt = pf * actual_lambda + t * (1.0 - actual_lambda)
+
+    # use a MSE-like loss function
+    loss = torch.pow(torch.abs(pt - qf), loss_params.pow_exp)
+    if loss_params.qp_asymmetry != 0.0:
+        loss = loss * ((qf > pt) * loss_params.qp_asymmetry + 1)
+
+    weights = 1 + (2.0**loss_params.w1 - 1) * torch.pow((pf - 0.5) ** 2 * pf * (1 - pf), loss_params.w2)
+    loss = (loss * weights).sum() / weights.sum()
+
+    return loss
 
 
 class NNUE(L.LightningModule):
-    """
-    feature_set - an instance of FeatureSet defining the input features
-
-    lambda_ = 0.0 - purely based on game results
-    0.0 < lambda_ < 1.0 - interpolated score and result
-    lambda_ = 1.0 - purely based on search scores
-
-    gamma - the multiplicative factor applied to the learning rate after each epoch
-
-    lr - the initial learning rate
-    """
 
     def __init__(
         self,
-        feature_set: FeatureSet,
-        config: ModelConfig,
-        max_epoch=800,
-        num_batches_per_epoch=int(100_000_000 / 16384),
-        gamma=0.992,
-        lr=8.75e-4,
+        config: NNUELightningConfig,
+        max_epoch=None,
+        num_batches_per_epoch=None,
         param_index=0,
         num_psqt_buckets=8,
         num_ls_buckets=8,
-        loss_params=LossParams(),
     ):
         super().__init__()
+
         self.model: NNUEModel = NNUEModel(
-            feature_set, config, num_psqt_buckets, num_ls_buckets
+            config.features,
+            config.model_config,
+            num_psqt_buckets,
+            num_ls_buckets,
         )
-        self.loss_params = loss_params
+        self.config = config
         self.max_epoch = max_epoch
         self.num_batches_per_epoch = num_batches_per_epoch
-        self.gamma = gamma
-        self.lr = lr
         self.param_index = param_index
+
+        # lazy init so `resume_from_model` with config changes works correctly
+        self.optimizer_wrapper = None
+
+        # Initialize the lambda controller
+        self.lambda_scheduler = LambdaController()
+
+        self.loss_metrics = MetricCollection(
+            {
+                "train_loss_epoch": MeanMetric(),
+                "val_loss_epoch": MeanMetric(),
+                "test_loss_epoch": MeanMetric(),
+            }
+        )
+
+    # --- setup optimizers and training hooks ---
+    def configure_optimizers(self):
+        optimizer_config = self.config.optimizer_config
+        self.optimizer_wrapper = optimizer_config.get_optimizer_wrapper()
+
+        LRs = [optimizer_config.lr] * 10
+
+        ft_wd = optimizer_config.ft_weight_decay
+        dense_wd = optimizer_config.dense_weight_decay
+        factorized_wd = optimizer_config.factorized_weight_decay
+
+        train_params = [
+            # Feature Transformer
+            {
+                "params": _get_parameters([self.model.input], get_biases=False),
+                "lr": LRs[0],
+                "weight_decay": ft_wd,
+            },
+            {
+                "params": _get_parameters([self.model.input], get_biases=True),
+                "lr": LRs[1],
+                "weight_decay": 0.0,
+            },
+            # Dense Layer Stacks
+            {
+                "params": [self.model.layer_stacks.l1.factorized_linear.weight],
+                "lr": LRs[2],
+                "weight_decay": factorized_wd,
+            },
+            {
+                "params": [self.model.layer_stacks.l1.factorized_linear.bias],
+                "lr": LRs[3],
+                "weight_decay": 0.0,
+            },
+            {
+                "params": [self.model.layer_stacks.l1.linear.weight],
+                "lr": LRs[4],
+                "weight_decay": dense_wd,
+            },
+            {
+                "params": [self.model.layer_stacks.l1.linear.bias],
+                "lr": LRs[5],
+                "weight_decay": 0.0,
+            },
+            {
+                "params": [self.model.layer_stacks.l2.linear.weight],
+                "lr": LRs[6],
+                "weight_decay": dense_wd,
+            },
+            {
+                "params": [self.model.layer_stacks.l2.linear.bias],
+                "lr": LRs[7],
+                "weight_decay": 0.0,
+            },
+            {
+                "params": [self.model.layer_stacks.output.linear.weight],
+                "lr": LRs[8],
+                "weight_decay": dense_wd,
+            },
+            {
+                "params": [self.model.layer_stacks.output.linear.bias],
+                "lr": LRs[9],
+                "weight_decay": 0.0,
+            },
+        ]
+
+        return self.optimizer_wrapper.configure_optimizers(train_params)
+
+    # --- train / eval switch ---
+    def train(self, mode: bool = True):
+        retval = super().train(mode)
+
+        if self.optimizer_wrapper is not None:
+            if mode:
+                self.optimizer_wrapper.switch_to_train(True)
+            else:
+                self.optimizer_wrapper.switch_to_eval()
+
+        return retval
+
+    def eval(self):
+        return self.train(False)
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
+
+    # --- lightning hooks ---
+    def on_train_epoch_start(self):
+        self.optimizer_wrapper.on_train_epoch_start(self)
+
+    def on_train_epoch_end(self):
+        self.optimizer_wrapper.on_train_epoch_end(self)
+        self._log_epoch_end("train_loss_epoch")
+
+    def on_validation_epoch_start(self):
+        self.optimizer_wrapper.on_validation_epoch_start(self)
+
+    def on_validation_epoch_end(self):
+        self._log_epoch_end("val_loss_epoch")
+
+    def on_test_epoch_start(self):
+        self.optimizer_wrapper.on_test_epoch_start(self)
+
+    def on_test_epoch_end(self):
+        self._log_epoch_end("test_loss_epoch")
+
+    def on_save_checkpoint(self, checkpoint):
+        self.optimizer_wrapper.on_save_checkpoint(self, checkpoint)
+        self.lambda_scheduler.on_save_checkpoint(checkpoint)
+
+    def on_load_checkpoint(self, checkpoint):
+        self.lambda_scheduler.on_load_checkpoint(self, checkpoint)
+
+    def on_train_batch_start(self, batch, batch_idx):
+        self.optimizer_wrapper.on_train_batch_start(self, batch, batch_idx)
+
+    def _log_epoch_end(self, loss_type):
+        self.log(
+            f"{loss_type}",
+            self.loss_metrics[f"{loss_type}"],
+            prog_bar=False,
+            sync_dist=True,
+            on_epoch=True,
+            on_step=False,
+        )
+
+    # --- Training step implementation ---
+
+    def training_step(self, batch, batch_idx):
+        return self.step_(batch, batch_idx, "train_loss")
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        self.step_(batch, batch_idx, "val_loss")
+
+    @torch.no_grad()
+    def test_step(self, batch, batch_idx):
+        self.step_(batch, batch_idx, "test_loss")
 
     def step_(self, batch: tuple[Tensor, ...], batch_idx, loss_type):
         _ = batch_idx  # unused, but required by pytorch-lightning
@@ -59,99 +229,44 @@ class NNUE(L.LightningModule):
             us,
             them,
             white_indices,
-            white_values,
             black_indices,
-            black_values,
             outcome,
             score,
-            psqt_indices,
-            layer_stack_indices,
+            piece_count,
         ) = batch
-
         scorenet = (
             self.model(
                 us,
                 them,
                 white_indices,
-                white_values,
                 black_indices,
-                black_values,
-                psqt_indices,
-                layer_stack_indices,
+                piece_count,
+                self.config.use_fake_act_quantization,
+                self.config.use_fake_weight_quantization
             )
-            * self.model.nnue2score
         )
 
-        p = self.loss_params
-        # convert the network and search scores to an estimate match result
-        # based on the win_rate_model, with scalings and offsets optimized
-        q = (scorenet - p.in_offset) / p.in_scaling
-        qm = (-scorenet - p.in_offset) / p.in_scaling
-        qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
+        scorenet = scorenet * self.model.quantization.nnue2score
 
-        s = (score - p.out_offset) / p.out_scaling
-        sm = (-score - p.out_offset) / p.out_scaling
-        pf = 0.5 * (1.0 + s.sigmoid() - sm.sigmoid())
-
-        # blend that eval based score with the actual game outcome
-        t = outcome
-        actual_lambda = p.start_lambda + (p.end_lambda - p.start_lambda) * (
-            self.current_epoch / self.max_epoch
-        )
-        pt = pf * actual_lambda + t * (1.0 - actual_lambda)
-
-        # use a MSE-like loss function
-        loss = torch.pow(torch.abs(pt - qf), p.pow_exp)
-        if p.qp_asymmetry != 0.0:
-            loss = loss * ((qf > pt) * p.qp_asymmetry + 1)
-        loss = loss.mean()
-
-        self.log(loss_type, loss, prog_bar=True)
-
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        return self.step_(batch, batch_idx, "train_loss")
-
-    def validation_step(self, batch, batch_idx):
-        self.step_(batch, batch_idx, "val_loss")
-
-    def test_step(self, batch, batch_idx):
-        self.step_(batch, batch_idx, "test_loss")
-
-    def configure_optimizers(self):
-        LR = self.lr
-        train_params = [
-            {"params": _get_parameters([self.model.input]), "lr": LR, "gc_dim": 0},
-            {"params": [self.model.layer_stacks.l1_fact.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.l1_fact.bias], "lr": LR},
-            {"params": [self.model.layer_stacks.l1.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.l1.bias], "lr": LR},
-            {"params": [self.model.layer_stacks.l2.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.l2.bias], "lr": LR},
-            {"params": [self.model.layer_stacks.output.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.output.bias], "lr": LR},
-        ]
-
-        optimizer = ranger21.Ranger21(
-            train_params,
-            lr=1.0,
-            betas=(0.9, 0.999),
-            eps=1.0e-7,
-            using_gc=False,
-            using_normgc=False,
-            weight_decay=0.0,
-            num_batches_per_epoch=self.num_batches_per_epoch,
-            num_epochs=self.max_epoch,
-            warmdown_active=False,
-            use_warmup=False,
-            use_adaptive_gradient_clipping=False,
-            softplus=False,
-            pnm_momentum_factor=0.0,
+        actual_lambda = self.lambda_scheduler(
+            loss_params=self.config.loss_params,
+            current_epoch=self.current_epoch,
+            max_epoch=self.max_epoch,
+            is_training=self.training,
+            scorenet=scorenet
         )
 
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=1, gamma=self.gamma
+        sf_loss = calculate_sf_loss(
+            scorenet, score, outcome, self.config.loss_params, actual_lambda
         )
 
-        return [optimizer], [scheduler]
+        self.loss_metrics[f"{loss_type}_epoch"].update(sf_loss)
+        self.log(
+            loss_type,
+            sf_loss,
+            prog_bar=False,
+            sync_dist=False,
+            on_epoch=False,
+            on_step=True,
+        )
+        return sf_loss

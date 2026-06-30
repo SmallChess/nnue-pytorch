@@ -5,7 +5,29 @@ import glob
 import numpy as np
 import torch
 
-from .config import CDataloaderSkipConfig
+from .config import CDataloaderSkipConfig, CDataloaderDDPConfig
+
+
+def _pin_and_move(t: torch.Tensor, device, use_pinned_memory=False, dtype=None) -> torch.Tensor:
+    if dtype is None:
+        dtype = t.dtype
+
+    # Must copy off SparseBatch-backed memory before it is freed
+    if torch.cuda.is_available() and use_pinned_memory:
+        # Allocate a pinned CPU tensor and copy the data directly into it.
+        # This is much faster than t.clone().pin_memory() which does two copies/allocations.
+        out = torch.empty(t.shape, dtype=dtype, layout=t.layout, device="cpu", pin_memory=True)
+        out.copy_(t)
+        if device == "cpu" or (isinstance(device, torch.device) and device.type == "cpu"):
+            return out
+        return out.to(device=device, non_blocking=True)
+    
+    # If not using pinned memory, just copy to standard CPU storage
+    out = torch.empty(t.shape, dtype=dtype, layout=t.layout, device="cpu")
+    out.copy_(t)
+    if device == "cpu" or (isinstance(device, torch.device) and device.type == "cpu"):
+        return out
+    return out.to(device=device)
 
 
 class SparseBatch(ctypes.Structure):
@@ -20,92 +42,57 @@ class SparseBatch(ctypes.Structure):
         ("max_active_features", ctypes.c_int),
         ("white", ctypes.POINTER(ctypes.c_int)),
         ("black", ctypes.POINTER(ctypes.c_int)),
-        ("white_values", ctypes.POINTER(ctypes.c_float)),
-        ("black_values", ctypes.POINTER(ctypes.c_float)),
-        ("psqt_indices", ctypes.POINTER(ctypes.c_int)),
-        ("layer_stack_indices", ctypes.POINTER(ctypes.c_int)),
+        ("piece_count", ctypes.POINTER(ctypes.c_int)),
     ]
 
-    def get_tensors(self, device):
-        white_values = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.white_values, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
+    def get_tensors(self, device, use_pinned_memory=False):
+        size = self.size
+        max_active = self.max_active_features
+
+        # We only transfer:
+        # - float block: is_white, outcome, score (3 * size floats)
+        # - int block: white, black, piece_count (2 * size * max_active + size ints)
+        total_floats = size * 3
+        total_ints = size * max_active * 2 + size
+
+        float_block_cpu = torch.from_numpy(
+            np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
         )
-        black_values = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.black_values, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
+        int_block_cpu = torch.from_numpy(
+            np.ctypeslib.as_array(self.white, shape=(total_ints,))
         )
-        white_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.white, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        black_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.black, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        us = (
-            torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(self.size, 1)))
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        them = 1.0 - us
-        outcome = (
-            torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(self.size, 1)))
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        score = (
-            torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(self.size, 1)))
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        psqt_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(self.psqt_indices, shape=(self.size,))
-            )
-            .long()
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        layer_stack_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))
-            )
-            .long()
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
+
+        float_block_gpu = _pin_and_move(float_block_cpu, device, use_pinned_memory)
+        int_block_gpu = _pin_and_move(int_block_cpu, device, use_pinned_memory)
+
+        us = float_block_gpu[0 : size].view(size, 1)
+        outcome = float_block_gpu[size : 2 * size].view(size, 1)
+        score = float_block_gpu[2 * size : 3 * size].view(size, 1)
+
+        white_indices = int_block_gpu[0 : size * max_active].view(size, max_active)
+        black_indices = int_block_gpu[size * max_active : 2 * size * max_active].view(size, max_active)
+        piece_count_i32 = int_block_gpu[2 * size * max_active : 2 * size * max_active + size].view(size)
+
+        # Keep piece counts as int64 so callers can derive buckets on the target device.
+        if not us.is_cuda and use_pinned_memory:
+            them = torch.empty_like(us, pin_memory=True)
+            them.fill_(1.0)
+            them.sub_(us)
+
+            piece_count = torch.empty(size, dtype=torch.int64, device="cpu", pin_memory=True)
+            piece_count.copy_(piece_count_i32)
+        else:
+            them = 1.0 - us
+            piece_count = piece_count_i32.to(dtype=torch.int64)
+
         return (
             us,
             them,
             white_indices,
-            white_values,
             black_indices,
-            black_values,
             outcome,
             score,
-            psqt_indices,
-            layer_stack_indices,
+            piece_count,
         )
 
 
@@ -129,7 +116,7 @@ class CDataLoaderAPI:
         self._define_prototypes()
 
     def _load_library(self):
-        for lib in glob.glob("./*training_data_loader.*"):
+        for lib in glob.glob("./build/*training_data_loader.*"):
             if not (
                 lib.endswith(".so") or lib.endswith("dll") or lib.endswith(".dylib")
             ):
@@ -144,7 +131,8 @@ class CDataLoaderAPI:
         #     const char* const* filenames,
         #     int batch_size,
         #     bool cyclic,
-        #     DataloaderSkipConfig config
+        #     DataloaderSkipConfig config,
+        #     DataloaderDDPConfig ddp_config
         # )
         self.dll.create_fen_batch_stream.restype = ctypes.c_void_p
         self.dll.create_fen_batch_stream.argtypes = [
@@ -154,6 +142,7 @@ class CDataLoaderAPI:
             ctypes.c_int,
             ctypes.c_bool,
             CDataloaderSkipConfig,
+            CDataloaderDDPConfig,
         ]
 
         # EXPORT void CDECL destroy_fen_batch_stream(FenBatchStream* stream)
@@ -170,7 +159,8 @@ class CDataLoaderAPI:
         #     const char* const* filenames,
         #     int batch_size,
         #     bool cyclic,
-        #     DataloaderSkipConfig config
+        #     DataloaderSkipConfig config,
+        #     DataloaderDDPConfig ddp_config
         # )
         self.dll.create_sparse_batch_stream.restype = ctypes.c_void_p
         self.dll.create_sparse_batch_stream.argtypes = [
@@ -181,6 +171,7 @@ class CDataLoaderAPI:
             ctypes.c_int,
             ctypes.c_bool,
             CDataloaderSkipConfig,
+            CDataloaderDDPConfig,
         ]
 
         # EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
@@ -212,9 +203,7 @@ class CDataLoaderAPI:
 type SparseBatchPtr = ctypes._Pointer[SparseBatch]
 type FenBatchPtr = ctypes._Pointer[FenBatch]
 
-
 try:
     c_lib = CDataLoaderAPI()
 except FileNotFoundError as e:
-    print(e)
-    exit(1)
+    raise ImportError(f"Failed to initialize CDataLoaderAPI: {e}.")

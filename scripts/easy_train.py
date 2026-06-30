@@ -553,7 +553,7 @@ class SystemResourcesMonitor(Thread):
     """
 
     def __init__(self, period_seconds):
-        super(SystemResourcesMonitor, self).__init__()
+        super().__init__()
 
         self._period_seconds = period_seconds
         self._mutex = Lock()
@@ -750,7 +750,7 @@ class TrainingRun(Thread):
         end_lambda=None,
         additional_args=[],
     ):
-        super(TrainingRun, self).__init__()
+        super().__init__()
         self._gpu_id = gpu_id
         self._run_id = run_id
 
@@ -1044,7 +1044,7 @@ def requests_get_content(url, *args, **kwargs):
 
 def get_zipfile_members_strip_common_prefix(zipfile):
     """
-    Removes a common previx from zipfile entries.
+    Removes a common prefix from zipfile entries.
     So for example will remove the top-level directory.
     """
     parts = []
@@ -1342,7 +1342,7 @@ class NetworkTesting(Thread):
         active=True,
         additional_args=[],
     ):
-        super(NetworkTesting, self).__init__()
+        super().__init__()
 
         self._nnue_pytorch_directory = os.path.abspath(nnue_pytorch_directory)
         self._root_dir = os.path.abspath(root_dir)
@@ -1536,7 +1536,7 @@ class NetworkTesting(Thread):
         try:
             with open(ordo_file_path, "r") as ordo_file:
                 lines = ordo_file.readlines()
-                # Pring the first few lines for the CLI interface.
+                # Print the first few lines for the CLI interface.
                 for line in lines[:7]:
                     LOGGER.info(line.strip())
                 for line in lines:
@@ -1590,7 +1590,7 @@ class TrainerRunsWidget(Widget):
     """
 
     def __init__(self, runs, name=None):
-        super(TrainerRunsWidget, self).__init__(name)
+        super().__init__(name)
 
         self._runs = list(sorted(runs, key=lambda x: (x.gpu_id, x.run_id)))
 
@@ -1789,7 +1789,7 @@ class TrainerRunsWidget(Widget):
 
 class MainView(Frame):
     def __init__(self, screen, training_runs, network_testing):
-        super(MainView, self).__init__(
+        super().__init__(
             screen,
             screen.height,
             screen.width,
@@ -1837,7 +1837,7 @@ class MainView(Frame):
 
     def reset(self):
         # Do standard reset to clear out form, then populate with new data.
-        super(MainView, self).reset()
+        super().reset()
 
     def _update_network_list(self):
         self._networks_view.options.clear()
@@ -1860,7 +1860,7 @@ class MainView(Frame):
         self._network_testing_status.value = self._network_testing.get_status_string()
 
     def update(self, frame_no):
-        super(MainView, self).update(frame_no)
+        super().update(frame_no)
 
         self._update_network_list()
         self._update_network_testing_status()
@@ -2442,7 +2442,7 @@ class TqdmDownloadProgressBar(tqdm):
 
 class TqdmToLogger(io.StringIO):
     def __init__(self):
-        super(TqdmToLogger, self).__init__()
+        super().__init__()
 
     def write(self, buf):
         self.buf = buf
@@ -2582,23 +2582,28 @@ def prepare_start_model_from_experiment(
 
 def get_default_feature_set_from_nnue_pytorch(nnue_pytorch_directory):
     """
-    features.py in nnue-pytorch defines the default feature set to use.
+    The features __init__.py in nnue-pytorch defines the default feature set to use.
     We scrape it for the feature set name.
     Normally we could import that file and let it add the argument to argparse,
     but we setup argparse before nnue-pytorch is setup so we have to do it like that.
     """
+    features_init = os.path.join(
+        nnue_pytorch_directory, "model", "modules", "features", "__init__.py"
+    )
     try:
-        with open(
-            os.path.join(nnue_pytorch_directory, "features.py"), "r"
-        ) as features_file:
+        with open(features_init, "r") as features_file:
             for line in features_file:
                 line = line.strip()
-                if line.startswith("_default_feature_set_name"):
-                    return line.split()[-1][1:-1]
-    except:
-        raise Exception(
-            "Could not infer the default feature set from the nnue-pytorch installation."
+                if line.startswith("default="):
+                    # Extract the default value from: default="HalfKAv2_hm^",
+                    return line.split('"')[1]
+    except Exception:
+        LOGGER.warning(
+            "Could not read default feature set from %s, using fallback.",
+            features_init,
+            exc_info=True,
         )
+    return "HalfKAv2_hm^"
 
 
 def parse_duration_hms_to_s(duration_str):
@@ -2719,7 +2724,7 @@ def main():
         )
     else:
         LOGGER.info(
-            "Not doing network testing. Either engines no provided or explicitely disabled."
+            "Not doing network testing. Either engines not provided or explicitly disabled."
         )
 
     nnue_pytorch_repo = "/".join(args.nnue_pytorch_branch.split("/")[:2])

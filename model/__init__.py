@@ -1,22 +1,42 @@
-from .callbacks import WeightClippingCallback
-from .config import ModelConfig, LossParams
-from .features import add_feature_args, FeatureSet, get_feature_set_from_name
+from .callbacks import WeightClippingCallback, ExplicitSWACallback
+from .config import ModelConfig, LossParams, NNUELightningConfig
+from .optimizers import OptimizerConfig, RangerLiteWrapper, ScheduleFreeWrapper
+
 from .lightning_module import NNUE
 from .model import NNUEModel
-from .utils import coalesce_ft_weights, load_model, NNUEReader, NNUEWriter
+from .modules import (
+    add_feature_args,
+    get_feature_cls,
+    get_available_features,
+    FeatureConfig,
+    LayerStacksConfig,
+)
+from .quantize import QuantizationConfig
+from .utils import (
+    load_model,
+    NNUEReader,
+    NNUEWriter,
+)
 
 
 __all__ = [
     "WeightClippingCallback",
+    "ExplicitSWACallback",
     "ModelConfig",
     "LossParams",
     "add_feature_args",
-    "FeatureSet",
-    "get_feature_set_from_name",
+    "get_feature_cls",
+    "get_available_features",
     "NNUE",
     "NNUEModel",
-    "coalesce_ft_weights",
+    "RangerLiteWrapper",
+    "ScheduleFreeWrapper",
     "load_model",
     "NNUEReader",
     "NNUEWriter",
+    "NNUELightningConfig",
+    "OptimizerConfig",
+    "FeatureConfig",
+    "LayerStacksConfig",
+    "QuantizationConfig",
 ]

@@ -1,8 +1,13 @@
 __pycache__/
+.container_home/
 env/
 build/
+build-pgo-generate/
 logs/
 testing
 libtraining_data_loader.*
 easy_train_data
 *.yaml
+pgo_data/
+bench
+bench_*

@@ -71,8 +71,6 @@ class GameParams:
 def convert_ckpt(root_dir, features):
     """Find the list of checkpoints that are available, and convert those that have no matching .nnue"""
     # run96/run0/default/version_0/checkpoints/epoch=3.ckpt, or epoch=3-step=321151.ckpt
-    p = re.compile("epoch.*\.ckpt")
-
     ckpts = [str(file) for file in Path(root_dir).rglob("epoch*.ckpt")]
 
     # lets move the .nnue files a bit up in the tree, and get rid of the = sign.
@@ -184,7 +182,7 @@ def run_match(
             f"option.EvalFile={evalfile}",
         ]
 
-    # Attempt to run the match multiple times in case of unforseen
+    # Attempt to run the match multiple times in case of unforeseen
     # errors like engine hanging or c-chess-cli having an error...
     for i in range(tries):
         print_atomic(" ".join(command))
@@ -281,7 +279,7 @@ class EngineResults:
 
 def run_approximate_ordo(root_dir):
     """run an approximate ordo-like calculation on an existing pgn file"""
-    """ it takes advantege of the fact that all matches are ran against master """
+    """ it takes advantage of the fact that all matches are ran against master """
     pgn_file_name = os.path.join(root_dir, "out.pgn")
     ordo_file_name = os.path.join(root_dir, "ordo.out")
     ordo_file_name_temp = os.path.join(root_dir, "ordo_temp.out")

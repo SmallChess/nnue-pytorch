@@ -1,4 +1,3 @@
-import argparse
 import time
 import warnings
 import os
@@ -10,10 +9,13 @@ import torch
 from torch import set_num_threads as t_set_num_threads
 from torch.utils.data import DataLoader
 from lightning.pytorch import loggers as pl_loggers
-from lightning.pytorch.callbacks import TQDMProgressBar, Callback, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 
 import data_loader
 import model as M
+import tyro
+
+from config import TrainingConfig
 
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
@@ -32,7 +34,7 @@ class TimeLimitAfterCheckpoint(Callback):
     def on_fit_start(self, trainer, pl_module):
         self.start_time = time.time()
 
-    def on_validation_end(self, trainer, pl_module):
+    def on_train_epoch_end(self, trainer, pl_module):
         elapsed = time.time() - self.start_time
         if elapsed >= self.max_duration:
             trainer.should_stop = True
@@ -41,18 +43,182 @@ class TimeLimitAfterCheckpoint(Callback):
             )
 
 
+class ConsolidatedCheckpoint(ModelCheckpoint):
+    def __init__(self, *args, **kwargs):
+        # We force this to True to decouple from the validation schedule
+        kwargs.setdefault("save_on_train_epoch_end", True)
+        kwargs.setdefault("monitor", None)
+        super().__init__(*args, **kwargs)
+
+    def on_train_end(self, trainer, pl_module):
+        if self.dirpath:
+            # Manually trigger a final save to last.ckpt
+            path = os.path.join(self.dirpath, "last.ckpt")
+            trainer.save_checkpoint(path)
+
+
+class SimpleLineLogger(Callback):
+    def __init__(
+        self,
+        refresh_rate=None,
+        train_metric_step="train_loss",
+        train_metric_epoch="train_loss_epoch",
+        val_metric="val_loss_epoch",
+    ):
+        super().__init__()
+        self.train_metric_step = train_metric_step
+        self.train_metric_epoch = train_metric_epoch
+        self.val_metric = val_metric
+
+        self.refresh_rate = refresh_rate
+
+        # Train tracking
+        self.train_start_time = None
+        self.train_last_time = None
+        self.train_last_step = 0
+
+        # Val tracking
+        self.val_start_time = None
+        self.val_last_time = None
+        self.val_last_step = 0
+
+    def _format_time(self, seconds):
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def _get_refresh_rate(self, trainer):
+        if self.refresh_rate is not None:
+            return self.refresh_rate
+        return trainer.log_every_n_steps
+
+    # ==========================================
+    # TRAINING LOOP
+    # ==========================================
+    @torch.compiler.disable
+    def on_train_epoch_start(self, trainer, pl_module):
+        if trainer.global_rank == 0:
+            self.train_start_time = time.time()
+            print("-" * 60)
+
+    @torch.compiler.disable
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.global_rank != 0:
+            return
+
+        current_step = batch_idx + 1
+        total_batches = trainer.num_training_batches
+
+        if (
+            current_step % self._get_refresh_rate(trainer) == 0
+            or current_step == total_batches
+        ):
+            now = time.time()
+            elapsed_total = now - self.train_start_time
+            rate = current_step / elapsed_total if elapsed_total > 0 else 0
+
+            remaining = (total_batches - current_step) / rate if rate > 0 else 0
+            loss_val = trainer.callback_metrics.get(
+                self.train_metric_step, float("nan")
+            )
+
+            print(
+                f"Epoch {trainer.current_epoch:>2} (Train): "
+                f"{current_step / total_batches:>4.0%}| "
+                f"{current_step:>5}/{total_batches:<5} "
+                f"[{self._format_time(elapsed_total)}<{self._format_time(remaining)}, "
+                f"{rate:>6.2f}it/s, "
+                f"{self.train_metric_step}={loss_val:.5f}, ",
+                f"v_num={trainer.logger.version}]",
+                flush=True,
+            )
+
+            self.train_last_time = now
+            self.train_last_step = current_step
+
+    @torch.compiler.disable
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.global_rank != 0 or trainer.sanity_checking:
+            return
+
+        pl_module._log_epoch_end(self.train_metric_epoch)
+        train_loss = trainer.callback_metrics.get(self.train_metric_epoch, float("nan"))
+        print(
+            f"Epoch {trainer.current_epoch:>2} (Train): "
+            f"[{self.train_metric_epoch}={train_loss:.5f}]",
+            flush=True,
+        )
+
+    # ==========================================
+    # VALIDATION LOOP
+    # ==========================================
+    @torch.compiler.disable
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if trainer.global_rank == 0 and not trainer.sanity_checking:
+            self.val_start_time = time.time()
+
+    @torch.compiler.disable
+    def on_validation_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
+    ):
+        if trainer.global_rank != 0 or trainer.sanity_checking:
+            return
+
+        current_step = batch_idx + 1
+        val_batches = trainer.num_val_batches
+        if isinstance(val_batches, int):
+            total_batches = val_batches
+        else:
+            total_batches = sum(val_batches)
+
+        if (
+            current_step % self._get_refresh_rate(trainer) == 0
+            or current_step == total_batches
+        ):
+            now = time.time()
+            elapsed_total = now - self.val_start_time
+
+            rate = current_step / elapsed_total if elapsed_total > 0 else 0
+            remaining = (total_batches - current_step) / rate if rate > 0 else 0
+
+            print(
+                f"Epoch {trainer.current_epoch:>2} (Val)  : "
+                f"{current_step / total_batches:>4.0%}| "
+                f"{current_step:>5}/{total_batches:<5} "
+                f"[{self._format_time(elapsed_total)}<{self._format_time(remaining)}, "
+                f"{rate:>6.2f}it/s]",
+                flush=True,
+            )
+
+    @torch.compiler.disable
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.global_rank != 0 or trainer.sanity_checking:
+            return
+
+        pl_module._log_epoch_end(self.val_metric)
+        val_loss = trainer.callback_metrics.get(self.val_metric, float("nan"))
+        print(
+            f"Epoch {trainer.current_epoch:>2} (Val): "
+            f"[{self.val_metric}={val_loss:.5f}]",
+            flush=True,
+        )
+
+
 def make_data_loaders(
     train_filenames,
     val_filenames,
-    feature_set: M.FeatureSet,
+    feature_name: str,
     num_workers,
     batch_size,
     config: data_loader.DataloaderSkipConfig,
     epoch_size,
     val_size,
+    pin_memory,
+    queue_size_limit,
+    prefetch_device=None,
 ):
     # Epoch and validation sizes are arbitrary
-    features_name = feature_set.name
+    features_name = feature_name
     train_infinite = data_loader.SparseBatchDataset(
         features_name,
         train_filenames,
@@ -60,288 +226,65 @@ def make_data_loaders(
         num_workers=num_workers,
         config=config,
     )
-    val_infinite = data_loader.SparseBatchDataset(
-        features_name,
-        val_filenames,
-        batch_size,
-        config=config,
-    )
     # num_workers has to be 0 for sparse, and 1 for dense
     # it currently cannot work in parallel mode but it shouldn't need to
     train = DataLoader(
         data_loader.FixedNumBatchesDataset(
-            train_infinite, (epoch_size + batch_size - 1) // batch_size
+            train_infinite,
+            (epoch_size + batch_size - 1) // batch_size,
+            pin_memory=pin_memory,
+            queue_size_limit=queue_size_limit,
+            device=prefetch_device,
         ),
         batch_size=None,
         batch_sampler=None,
+        num_workers=0,
     )
-    val = DataLoader(
-        data_loader.FixedNumBatchesDataset(
-            val_infinite, (val_size + batch_size - 1) // batch_size
-        ),
-        batch_size=None,
-        batch_sampler=None,
-    )
+    if val_size <= 0:
+        val = None
+    elif val_filenames is None:
+        val = DataLoader(
+            data_loader.FixedNumBatchesDataset(
+                train_infinite,
+                (val_size + batch_size - 1) // batch_size,
+                pin_memory=pin_memory,
+                queue_size_limit=queue_size_limit,
+                device=prefetch_device,
+            ),
+            batch_size=None,
+            batch_sampler=None,
+            num_workers=0,
+        )
+    else:
+        val_infinite = data_loader.SparseBatchDataset(
+            features_name,
+            val_filenames,
+            batch_size,
+            config=config,
+        )
+        val = DataLoader(
+            data_loader.FixedNumBatchesDataset(
+                val_infinite,
+                (val_size + batch_size - 1) // batch_size,
+                pin_memory=pin_memory,
+                queue_size_limit=queue_size_limit,
+                device=prefetch_device,
+            ),
+            batch_size=None,
+            batch_sampler=None,
+            num_workers=0,
+        )
     return train, val
 
 
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ("yes", "true", "t", "y", "1"):
-        return True
-    elif v.lower() in ("no", "false", "f", "n", "0"):
-        return False
-    else:
-        raise argparse.ArgumentTypeError("Boolean value expected.")
-
-
-def flatten_once(lst):
-    return sum(lst, [])
+def is_master_process():
+    # torchrun sets 'RANK'. If not set, we assume it's a single-process run (Rank 0).
+    return int(os.environ.get("RANK", 0)) == 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trains the network.")
-    parser.add_argument(
-        "datasets",
-        action="append",
-        nargs="+",
-        help="Training datasets (.binpack). Interleaved at chunk level if multiple specified. Same data is used for training and validation if not validation data is specified.",
-    )
-    parser.add_argument(
-        "--default_root_dir",
-        type=str,
-        default=None,
-        dest="default_root_dir",
-        help="Default root directory for logs and checkpoints. Default: None (use current directory).",
-    )
-    parser.add_argument(
-        "--gpus",
-        type=str,
-        default=None,
-        dest="gpus",
-        help="List of gpus to use, e.g. 0,1,2,3 for 4 gpus. Default: None (use all available gpus).",
-    )
-    parser.add_argument(
-        "--max_epochs",
-        default=800,
-        type=int,
-        dest="max_epochs",
-        help="Maximum number of epochs to train for. Default 800.",
-    )
-    parser.add_argument(
-        "--max_time",
-        default="30:00:00:00",
-        type=str,
-        dest="max_time",
-        help="The maximum time to train for. A string in the format DD:HH:MM:SS (Default 30:00:00:00).",
-    )
-    parser.add_argument(
-        "--validation-data",
-        type=str,
-        action="append",
-        nargs="+",
-        dest="validation_datasets",
-        help="Validation data to use for validation instead of the training data.",
-    )
-    parser.add_argument(
-        "--lambda",
-        default=1.0,
-        type=float,
-        dest="lambda_",
-        help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).",
-    )
-    parser.add_argument(
-        "--start-lambda",
-        default=None,
-        type=float,
-        dest="start_lambda",
-        help="lambda to use at first epoch.",
-    )
-    parser.add_argument(
-        "--end-lambda",
-        default=None,
-        type=float,
-        dest="end_lambda",
-        help="lambda to use at last epoch.",
-    )
-    parser.add_argument(
-        "--qp-asymmetry",
-        default=0.0,
-        type=float,
-        dest="qp_asymmetry",
-        help="Adjust to loss for those if q (prediction) > p (reference) (default=0.0)",
-    )
-    parser.add_argument(
-        "--pow-exp",
-        default=2.5,
-        type=float,
-        dest="pow_exp",
-        help="exponent of the power law used for the mean error (default=2.5)",
-    )
-    parser.add_argument(
-        "--in-offset",
-        default=270,
-        type=float,
-        dest="in_offset",
-        help="offset for conversion to win on input (default=270.0)",
-    )
-    parser.add_argument(
-        "--out-offset",
-        default=270,
-        type=float,
-        dest="out_offset",
-        help="offset for conversion to win on input (default=270.0)",
-    )
-    parser.add_argument(
-        "--in-scaling",
-        default=340,
-        type=float,
-        dest="in_scaling",
-        help="scaling for conversion to win on input (default=340.0)",
-    )
-    parser.add_argument(
-        "--out-scaling",
-        default=380,
-        type=float,
-        dest="out_scaling",
-        help="scaling for conversion to win on input (default=380.0)",
-    )
-    parser.add_argument(
-        "--gamma",
-        default=0.992,
-        type=float,
-        dest="gamma",
-        help="Multiplicative factor applied to the learning rate after every epoch.",
-    )
-    parser.add_argument(
-        "--lr", default=8.75e-4, type=float, dest="lr", help="Initial learning rate."
-    )
-    parser.add_argument(
-        "--num-workers",
-        default=1,
-        type=int,
-        dest="num_workers",
-        help="Number of worker threads to use for data loading. Currently only works well for binpack.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        default=-1,
-        type=int,
-        dest="batch_size",
-        help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.",
-    )
-    parser.add_argument(
-        "--threads",
-        default=-1,
-        type=int,
-        dest="threads",
-        help="Number of torch threads to use. Default automatic (cores) .",
-    )
-    parser.add_argument(
-        "--compile-backend",
-        default="inductor",
-        choices=["inductor", "cudagraphs"],
-        type=str,
-        dest="compile_backend",
-        help="Which backend to use for torch.compile. inductor works well with larger nets, cudagraphs with smaller nets",
-    )
-    parser.add_argument(
-        "--seed", default=42, type=int, dest="seed", help="torch seed to use."
-    )
-    parser.add_argument(
-        "--smart-fen-skipping",
-        action="store_true",
-        dest="smart_fen_skipping_deprecated",
-        help="If enabled positions that are bad training targets will be skipped during loading. Default: True, kept for backwards compatibility. This option is ignored",
-    )
-    parser.add_argument(
-        "--no-smart-fen-skipping",
-        action="store_true",
-        dest="no_smart_fen_skipping",
-        help="If used then no smart fen skipping will be done. By default smart fen skipping is done.",
-    )
-    parser.add_argument(
-        "--no-wld-fen-skipping",
-        action="store_true",
-        dest="no_wld_fen_skipping",
-        help="If used then no wld fen skipping will be done. By default wld fen skipping is done.",
-    )
-    parser.add_argument(
-        "--random-fen-skipping",
-        default=3,
-        type=int,
-        dest="random_fen_skipping",
-        help="skip fens randomly on average random_fen_skipping before using one.",
-    )
-    parser.add_argument(
-        "--resume-from-model",
-        dest="resume_from_model",
-        help="Initializes training using the weights from the given .pt model",
-    )
-    parser.add_argument(
-        "--resume-from-checkpoint",
-        dest="resume_from_checkpoint",
-        help="Initializes training using a given .ckpt model",
-    )
-    parser.add_argument(
-        "--network-save-period",
-        type=int,
-        default=20,
-        dest="network_save_period",
-        help="Number of epochs between network snapshots. None to disable.",
-    )
-    parser.add_argument(
-        "--save-last-network",
-        type=str2bool,
-        default=True,
-        dest="save_last_network",
-        help="Whether to always save the last produced network.",
-    )
-    parser.add_argument(
-        "--epoch-size",
-        type=int,
-        default=100000000,
-        dest="epoch_size",
-        help="Number of positions per epoch.",
-    )
-    parser.add_argument(
-        "--validation-size",
-        type=int,
-        default=1000000,
-        dest="validation_size",
-        help="Number of positions per validation step.",
-    )
-    parser.add_argument(
-        "--param-index",
-        type=int,
-        default=0,
-        dest="param_index",
-        help="Indexing for parameter scans.",
-    )
-    parser.add_argument(
-        "--early-fen-skipping",
-        type=int,
-        default=-1,
-        dest="early_fen_skipping",
-        help="Skip n plies from the start.",
-    )
-    parser.add_argument(
-        "--simple-eval-skipping",
-        type=int,
-        default=-1,
-        dest="simple_eval_skipping",
-        help="Skip positions that have abs(simple_eval(pos)) < n",
-    )
-    parser.add_argument("--l1", type=int, default=M.ModelConfig().L1)
-    M.add_feature_args(parser)
-    args = parser.parse_args()
-
-    args.datasets = flatten_once(args.datasets)
-    if args.validation_datasets:
-        args.validation_datasets = flatten_once(args.validation_datasets)
-    else:
-        args.validation_datasets = []
+    args = tyro.cli(TrainingConfig)
+    actual_threads, actual_workers = args.threads, args.num_workers
 
     for dataset in args.datasets:
         if not os.path.exists(dataset):
@@ -352,141 +295,222 @@ def main():
             raise Exception("{0} does not exist".format(val_dataset))
 
     train_datasets = args.datasets
-    val_datasets = train_datasets
+    val_datasets = None
+
     if len(args.validation_datasets) > 0:
         val_datasets = args.validation_datasets
 
-    if (args.start_lambda is not None) != (args.end_lambda is not None):
-        raise Exception(
-            "Either both or none of start_lambda and end_lambda must be specified."
+    global_batch_size_requested = args.batch_size
+
+    accelerator = args.accelerator
+    if accelerator == "auto":
+        if torch.cuda.is_available():
+            accelerator = "cuda"
+        elif torch.backends.mps.is_available():
+            accelerator = "mps"
+        else:
+            accelerator = "cpu"
+
+    if args.compile_backend == "cudagraphs" and accelerator != "cuda":
+        raise ValueError(
+            f"--compile-backend=cudagraphs requires accelerator='cuda', "
+            f"got accelerator='{accelerator}'. Use --compile-backend=inductor instead."
         )
 
-    batch_size = args.batch_size
-    if batch_size <= 0:
-        batch_size = 16384
-    print("Using batch size {}".format(batch_size))
-
-    feature_set = M.get_feature_set_from_name(args.features)
-
-    loss_params = M.LossParams(
-        in_offset=args.in_offset,
-        in_scaling=args.in_scaling,
-        out_offset=args.out_offset,
-        out_scaling=args.out_scaling,
-        start_lambda=args.start_lambda or args.lambda_,
-        end_lambda=args.end_lambda or args.lambda_,
-        pow_exp=args.pow_exp,
-        qp_asymmetry=args.qp_asymmetry,
-    )
-    print("Loss parameters:")
-    print(loss_params)
+    # temporarily default to using only device 0 if user didn't specify --gpus
+    # doing this so that batch size is consistent since if we rely on "auto" behavior
+    # we don't know at this point in the code what the world size is.
+    # TODO: refactor initialization so that we can support default behavior of "auto" with proper batch sizing
+    if accelerator == "cuda":
+        if args.gpus:
+            try:
+                devices = [int(x) for x in args.gpus.rstrip(",").split(",") if x]
+            except ValueError:
+                print(
+                    f"Invalid --gpus argument: '{args.gpus}'. "
+                    "Expected a comma separated list of ints, e.g. 0,1",
+                    file=sys.stderr,
+                )
+                return
+        else:
+            devices = [0]
+        n_devices = len(devices)
+        if n_devices == 0:
+            print(
+                f"Invalid --gpus argument: '{args.gpus}'. "
+                "Expected a comma separated list of ints, e.g. 0,1",
+                file=sys.stderr,
+            )
+            return
+    else:
+        if args.gpus:
+            print(
+                f"Warning: --gpus is ignored for accelerator='{accelerator}'",
+                file=sys.stderr,
+            )
+        devices = 1
+        n_devices = 1
+    if global_batch_size_requested % n_devices != 0:
+        msg = (
+            f"--batch-size {global_batch_size_requested} must be divisible by "
+            f"number of devices ({n_devices}) for accelerator='{accelerator}'."
+        )
+        if accelerator == "cuda":
+            msg += f" Got --gpus={args.gpus or '0'}."
+        raise ValueError(msg)
+    per_gpu_batch_size = global_batch_size_requested // n_devices
+    feature_name = args.nnue_lightning_config.features
 
     max_epoch = args.max_epochs or 800
     if args.resume_from_model is None:
         nnue = M.NNUE(
-            feature_set=feature_set,
-            loss_params=loss_params,
+            config=args.nnue_lightning_config,
             max_epoch=max_epoch,
-            num_batches_per_epoch=args.epoch_size / batch_size,
-            gamma=args.gamma,
-            lr=args.lr,
-            param_index=args.param_index,
-            config=M.ModelConfig(L1=args.l1),
+            num_batches_per_epoch=args.num_batches_per_epoch,
+            param_index=args.dataloader_config.param_index,
         )
     else:
-        nnue = torch.load(args.resume_from_model, weights_only=False)
-        nnue.model.set_feature_set(feature_set)
-        nnue.loss_params = loss_params
-        nnue.max_epoch = max_epoch
-        nnue.num_batches_per_epoch = args.epoch_size / batch_size
+        assert os.path.exists(args.resume_from_model)
+        try:
+            nnue = torch.load(
+                args.resume_from_model, weights_only=False, map_location="cpu"
+            )
+            nnue.train()
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                f"Could not load checkpoint: {e}. The model to be resumed was probably saved with a different version of the code."
+            )
         # we can set the following here just like that because when resuming
         # from .pt the optimizer is only created after the training is started
-        nnue.gamma = args.gamma
-        nnue.lr = args.lr
-        nnue.param_index = args.param_index
+        nnue.max_epoch = max_epoch
+        nnue.num_batches_per_epoch = args.num_batches_per_epoch
+        nnue.config = args.nnue_lightning_config
+        nnue.param_index = args.dataloader_config.param_index
 
-    print("Feature set: {}".format(feature_set.name))
-    print("Num real features: {}".format(feature_set.num_real_features))
-    print("Num virtual features: {}".format(feature_set.num_virtual_features))
-    print("Num features: {}".format(feature_set.num_features))
-
-    print("Training with: {}".format(train_datasets))
-    print("Validating with: {}".format(val_datasets))
+    input_feature_name = nnue.model.input_feature_name
 
     L.seed_everything(args.seed)
-    print("Seed {}".format(args.seed))
-
-    print("Smart fen skipping: {}".format(not args.no_smart_fen_skipping))
-    print("WLD fen skipping: {}".format(not args.no_wld_fen_skipping))
-    print("Random fen skipping: {}".format(args.random_fen_skipping))
-    print("Skip early plies: {}".format(args.early_fen_skipping))
-    print("Skip simple eval : {}".format(args.simple_eval_skipping))
-    print("Param index: {}".format(args.param_index))
-
-    if args.threads > 0:
-        print("limiting torch to {} threads.".format(args.threads))
-        t_set_num_threads(args.threads)
 
     logdir = args.default_root_dir if args.default_root_dir else "logs/"
-    print("Using log dir {}".format(logdir), flush=True)
-
     tb_logger = pl_loggers.TensorBoardLogger(logdir)
-    checkpoint_callback = ModelCheckpoint(
+    csv_logger = pl_loggers.CSVLogger(logdir, version=tb_logger.version)
+    loggers = [tb_logger, csv_logger]
+
+    if is_master_process():
+        print(
+            f"batch_size(global)={global_batch_size_requested} | n_devices={n_devices} | batch_size(per_gpu)={per_gpu_batch_size}"
+        )
+        print("Loss parameters:")
+        print(args.nnue_lightning_config.loss_params)
+        print("Feature set: {}".format(feature_name))
+        print("Num inputs: {}".format(nnue.model.input.NUM_INPUTS))
+
+        print("Training with: {}".format(train_datasets))
+        print("Validating with: {}".format(val_datasets))
+        print("Seed {}".format(args.seed))
+        print(args.dataloader_config)
+        print("Using log dir {}".format(tb_logger.log_dir))
+        print(f"Using {actual_workers} workers for C++ data loader.")
+        if actual_threads > 0:
+            print("Set torch num_threads to {} threads.".format(actual_threads))
+        else:
+            print("Using default torch num_threads setting.")
+        print("", flush=True)
+
+    checkpoint_callback = ConsolidatedCheckpoint(
         save_last=args.save_last_network,
         every_n_epochs=args.network_save_period,
-        save_top_k=-1,
+        save_top_k=args.save_top_k,
     )
+
+    if accelerator == "mps":
+        # On MPS, torch.compile is currently unstable
+        if is_master_process():
+            print("Disabling torch.compile for accelerator='mps'.")
+    else:
+        # Since we compile the entire lightning module we have quite a few graph breaks
+        torch._dynamo.config.cache_size_limit = 64
+        nnue = torch.compile(nnue, backend=args.compile_backend)
+    # PL hack, undo slurm cluster detection which is broken for us. 'force interactive mode'
+    # see lightning/fabric/plugins/environments/slurm.py near line 110
+    os.environ["SLURM_JOB_NAME"] = "bash"
+
+    train, val = make_data_loaders(
+        train_datasets,
+        val_datasets,
+        input_feature_name,
+        actual_workers,
+        per_gpu_batch_size,
+        args.dataloader_config,
+        args.epoch_size,
+        args.validation_size,
+        pin_memory=args.pin_memory and accelerator == "cuda",
+        queue_size_limit=args.data_loader_queue_size,
+        prefetch_device=torch.device("cuda") if accelerator == "cuda" else None,
+    )
+
+    refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)
+    trainer_callbacks = [
+            checkpoint_callback,
+            SimpleLineLogger(refresh_rate=refresh_rate),
+            TimeLimitAfterCheckpoint(args.max_time),
+            M.WeightClippingCallback(),
+        ]
+    if 0 <= args.swa_start_epoch < args.max_epochs:
+        swa_callback = M.ExplicitSWACallback(args.swa_start_epoch, tb_logger.log_dir)
+        trainer_callbacks.append(
+            swa_callback
+        )
 
     trainer = L.Trainer(
         default_root_dir=logdir,
         max_epochs=args.max_epochs,
-        accelerator="cuda",
-        devices=[int(x) for x in args.gpus.rstrip(",").split(",") if x]
-        if args.gpus
-        else "auto",
-        logger=tb_logger,
-        callbacks=[
-            checkpoint_callback,
-            TQDMProgressBar(refresh_rate=300),
-            TimeLimitAfterCheckpoint(args.max_time),
-            M.WeightClippingCallback(),
-        ],
-        enable_progress_bar=True,
+        accelerator=accelerator,
+        strategy="ddp" if n_devices > 1 else "auto",
+        devices=devices,
+        logger=loggers,
+        callbacks=trainer_callbacks,
+        log_every_n_steps=refresh_rate,
+        enable_progress_bar=False,
         enable_checkpointing=True,
         benchmark=True,
+        num_sanity_val_steps=0 if val is None else 2,
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
     )
 
-    nnue = torch.compile(nnue, backend=args.compile_backend)
-
-    print("Using C++ data loader")
-    train, val = make_data_loaders(
-        train_datasets,
-        val_datasets,
-        feature_set,
-        args.num_workers,
-        batch_size,
-        data_loader.DataloaderSkipConfig(
-            filtered=not args.no_smart_fen_skipping,
-            random_fen_skipping=args.random_fen_skipping,
-            wld_filtered=not args.no_wld_fen_skipping,
-            early_fen_skipping=args.early_fen_skipping,
-            simple_eval_skipping=args.simple_eval_skipping,
-            param_index=args.param_index,
-        ),
-        args.epoch_size,
-        args.validation_size,
-    )
+    if actual_threads > 0:
+        t_set_num_threads(actual_threads)
 
     if args.resume_from_checkpoint:
         trainer.fit(nnue, train, val, ckpt_path=args.resume_from_checkpoint)
     else:
         trainer.fit(nnue, train, val)
 
-    with open(os.path.join(logdir, "training_finished"), "w"):
-        pass
+    if 0 <= args.swa_start_epoch < args.max_epochs:
+        nnue.eval()
+        swa_callback.swap_weights(nnue, to_eval=True)
+        if val is not None:
+            trainer.validate(nnue, val)
+        else:
+            trainer.validate(nnue, train)
+        swa_callback.swap_weights(nnue, to_eval=False)
+
+
+    if trainer.is_global_zero:
+        last_savepath = os.path.join(tb_logger.log_dir, "checkpoints", "last.ckpt")
+        swa_savepath = os.path.join(tb_logger.log_dir, "checkpoints", "last_swa.ckpt")
+        non_swa_path =  os.path.join(tb_logger.log_dir, "checkpoints", "last_non_swa.ckpt")
+        if os.path.exists(swa_savepath):
+            if os.path.exists(last_savepath):
+                print(f"Renaming existing checkpoint at {last_savepath} to {non_swa_path} to preserve original model.")
+                os.rename(last_savepath, non_swa_path)
+            os.rename(swa_savepath, last_savepath)
+
+        with open(os.path.join(logdir, "training_finished"), "w"):
+            pass
 
 
 if __name__ == "__main__":
     main()
     if sys.platform == "win32":
-        os.system(f'wmic process where processid="{os.getpid()}" call terminate >nul')
+        os._exit(0)

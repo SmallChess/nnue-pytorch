@@ -1,23 +1,52 @@
-import argparse
 import subprocess
 import re
+import math
+
+import tyro
 
 import chess
 
 import data_loader
-from model import (
-    add_feature_args,
-    FeatureSet,
-    get_feature_set_from_name,
-    NNUE,
-    NNUEReader,
-    ModelConfig,
-)
+import model as M
+
+from dataclasses import dataclass
+from typing import Optional, Literal
+from tyro.conf import OmitArgPrefixes
+
+@dataclass(frozen=True)
+class CrossCheckConfig:
+    # Flags and Options
+    engine: str
+    """Path to the engine binary to use for evaluation."""
+
+    data: str
+    """Path to the .bin or .binpack dataset to use for evaluation."""
+
+    net: str
+    """Path to the .nnue net to evaluate."""
+
+    checkpoint: Optional[str] = None
+    """Optional checkpoint (used instead of nnue for local eval)."""
+
+    device: Literal["cuda", "mps", "cpu"] = "cuda"
+    """Device for the NNUE model."""
+
+    count: int = 8 * 2**10
+    """Number of positions to process."""
 
 
-def read_model(nnue_path, feature_set: FeatureSet, config: ModelConfig):
+@dataclass(frozen=True)
+class CliConfig:
+    cross_check_config: OmitArgPrefixes[CrossCheckConfig]
+    nnue_lightning_config: OmitArgPrefixes[M.NNUELightningConfig]
+
+
+def read_model(
+    nnue_path,
+    config: M.NNUELightningConfig,
+):
     with open(nnue_path, "rb") as f:
-        reader = NNUEReader(f, feature_set, config)
+        reader = M.NNUEReader(f, config.features, config.model_config)
         return reader.model
 
 
@@ -28,24 +57,22 @@ def make_fen_batch_provider(data_path, batch_size):
         1,
         batch_size,
         data_loader.DataloaderSkipConfig(
-            random_fen_skipping=10,
+            random_fen_skipping=5,
+            soft_early_fen_skipping=-1,
         ),
     )
 
 
-def eval_model_batch(model, batch: data_loader.SparseBatchPtr):
+def eval_model_batch(model: M.NNUEModel, batch: data_loader.SparseBatchPtr, device: str, fake_quantize: bool):
     (
         us,
         them,
         white_indices,
-        white_values,
         black_indices,
-        black_values,
         outcome,
         score,
-        psqt_indices,
-        layer_stack_indices,
-    ) = batch.contents.get_tensors("cuda")
+        piece_count,
+    ) = batch.contents.get_tensors(device)
 
     evals = [
         v.item()
@@ -53,81 +80,180 @@ def eval_model_batch(model, batch: data_loader.SparseBatchPtr):
             us,
             them,
             white_indices,
-            white_values,
             black_indices,
-            black_values,
-            psqt_indices,
-            layer_stack_indices,
+            piece_count,
+            fake_quantize_acts=fake_quantize,
+            fake_quantize_weights=fake_quantize,
         )
-        * 600.0
+        * model.quantization.nnue2score
     ]
-    for i in range(len(evals)):
-        if them[i] > 0.5:
-            evals[i] = -evals[i]
     return evals
 
 
-re_nnue_eval = re.compile(r"NNUE evaluation:?\s*?([-+]?\d*?\.\d*)")
+re_nnue_eval = re.compile(
+    r"NNUE evaluation\s+([-+]?\d+)\s+\(side to move, internal units\)"
+)
+
+
+def sigmoid(x):
+    if x >= 0:
+        z = math.exp(-x)
+        return 1 / (1 + z)
+    else:
+        z = math.exp(x)
+        return z / (1 + z)
+
+
+def calculate_qf(score, offset, scaling):
+    q = (score - offset) / scaling
+    qm = (-score - offset) / scaling
+    return 0.5 * (1.0 + sigmoid(q) - sigmoid(qm))
+
+
+def get_percentile(data, percentile):
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    index = (len(sorted_data) - 1) * percentile
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    weight = index - lower
+    return sorted_data[lower] * (1 - weight) + sorted_data[upper] * weight
 
 
 def compute_basic_eval_stats(evals):
-    min_engine_eval = min(evals)
-    max_engine_eval = max(evals)
-    avg_engine_eval = sum(evals) / len(evals)
-    avg_abs_engine_eval = sum(abs(v) for v in evals) / len(evals)
+    if not evals:
+        return 0, 0, 0, 0
+    min_val = min(evals)
+    max_val = max(evals)
+    avg_val = sum(evals) / len(evals)
+    avg_abs_val = sum(abs(v) for v in evals) / len(evals)
+    return min_val, max_val, avg_val, avg_abs_val
 
-    return min_engine_eval, max_engine_eval, avg_engine_eval, avg_abs_engine_eval
 
+def compute_correlation(cmp_evals, ref_evals, fens, title, cmp_name, ref_name):
+    if len(ref_evals) != len(cmp_evals):
+        raise Exception(f"Mismatch: {len(ref_evals)} vs {len(cmp_evals)}")
 
-def compute_correlation(engine_evals, model_evals):
-    if len(engine_evals) != len(model_evals):
-        raise Exception(
-            "number of engine evals doesn't match the number of model evals"
+    # Trainer parameters from your configuration
+    IN_OFFSET = 280.0
+    IN_SCALING = 353.0
+
+    data = []
+    abs_errors = []
+    q_errors = []
+
+    for e, m, f in zip(ref_evals, cmp_evals, fens):
+        ae = abs(m - e)
+        # relative error, with a floor to avoid division by zero and to not exaggerate small evals too much
+        ae_rel = ae / (max(abs(e), 1/32))
+        q_ref = calculate_qf(e, IN_OFFSET, IN_SCALING)
+        q_cmp = calculate_qf(m, IN_OFFSET, IN_SCALING)
+        qe = abs(q_cmp - q_ref)
+
+        abs_errors.append(ae)
+        q_errors.append(qe)
+        data.append(
+            {
+                "fen": f,
+                "ref": e,
+                "cmp": m,
+                "abs_err": ae,
+                "rel_err": ae_rel,
+                "q_ref": q_ref,
+                "q_cmp": q_cmp,
+                "q_err": qe,
+            }
         )
 
-    min_engine_eval, max_engine_eval, avg_engine_eval, avg_abs_engine_eval = (
-        compute_basic_eval_stats(engine_evals)
-    )
-    min_model_eval, max_model_eval, avg_model_eval, avg_abs_model_eval = (
-        compute_basic_eval_stats(model_evals)
-    )
+    # R^2 Calculation for Scores
+    mean_sf = sum(ref_evals) / len(ref_evals)
+    ss_res = sum((d["ref"] - d["cmp"]) ** 2 for d in data)
+    ss_tot = sum((d["ref"] - mean_sf) ** 2 for d in data)
+    r_squared_score = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0.0
 
-    print("Min engine/model eval: {} / {}".format(min_engine_eval, min_model_eval))
-    print("Max engine/model eval: {} / {}".format(max_engine_eval, max_model_eval))
-    print("Avg engine/model eval: {} / {}".format(avg_engine_eval, avg_model_eval))
+    # R^2 Calculation for Q (Expected Score)
+    mean_q_ref = sum(d["q_ref"] for d in data) / len(data)
+    ss_res_q = sum((d["q_ref"] - d["q_cmp"]) ** 2 for d in data)
+    ss_tot_q = sum((d["q_ref"] - mean_q_ref) ** 2 for d in data)
+    r_squared_q = 1 - (ss_res_q / ss_tot_q) if ss_tot_q != 0 else 0.0
+
+    # Summary Stats
+    en_min, en_max, _, en_abs_avg = compute_basic_eval_stats(ref_evals)
+    py_min, py_max, _, py_abs_avg = compute_basic_eval_stats(cmp_evals)
+
+    W = 115
+    print("\n" + "=" * W)
+    print(f"{title:^{W}}")
+    print("=" * W)
     print(
-        "Avg abs engine/model eval: {} / {}".format(
-            avg_abs_engine_eval, avg_abs_model_eval
-        )
+        f"{'Metric':<30} | {'Score (Internal Units)':>38} | {'Q (Expected Score)':>38}"
+    )
+    print("-" * W)
+
+    # 1. Values Summary
+    print(
+        f"{f'Average Absolute Value ({ref_name})':<30} | {en_abs_avg:>38.2f} | {sum(d['q_ref'] for d in data) / len(data):>38.4f}"
+    )
+    print(
+        f"{f'Min / Max Value ({ref_name})':<30} | {en_min:>17.1f} / {en_max:<18.1f} | {min(d['q_ref'] for d in data):>17.4f} / {max(d['q_ref'] for d in data):<18.4f}"
+    )
+    print("-" * W)
+
+    print(
+        f"{f'Average Absolute Value ({cmp_name})':<30} | {py_abs_avg:>38.2f} | {sum(d['q_cmp'] for d in data) / len(data):>38.4f}"
+    )
+    print(
+        f"{f'Min / Max Value ({cmp_name})':<30} | {py_min:>17.1f} / {py_max:<18.1f} | {min(d['q_cmp'] for d in data):>17.4f} / {max(d['q_cmp'] for d in data):<18.4f}"
+    )
+    print("-" * W)
+
+    # 2. Correlation and Errors Summary
+    print(
+        f"{'Correlation (R^2)':<30} | {r_squared_score:>38.6f} | {r_squared_q:>38.6f}"
+    )
+    print(
+        f"{'Avg Absolute Error (Mean)':<30} | {sum(abs_errors) / len(data):>38.2f} | {sum(q_errors) / len(data):>38.6f}"
     )
 
-    relative_model_error = sum(
-        abs(model - engine) / (abs(engine) + 0.001)
-        for model, engine in zip(model_evals, engine_evals)
-    ) / len(engine_evals)
-    relative_engine_error = sum(
-        abs(model - engine) / (abs(model) + 0.001)
-        for model, engine in zip(model_evals, engine_evals)
-    ) / len(engine_evals)
-    min_diff = min(
-        abs(model - engine) for model, engine in zip(model_evals, engine_evals)
-    )
-    max_diff = max(
-        abs(model - engine) for model, engine in zip(model_evals, engine_evals)
-    )
-    print("Relative engine error: {}".format(relative_engine_error))
-    print("Relative model error: {}".format(relative_model_error))
-    print(
-        "Avg abs difference: {}".format(
-            sum(abs(model - engine) for model, engine in zip(model_evals, engine_evals))
-            / len(engine_evals)
+    # Quantiles (Sigma intervals)
+    for label, p in [
+        ("1-Sigma Error (68.3%)", 0.6827),
+        ("2-Sigma Error (95.5%)", 0.9545),
+        ("3-Sigma Error (99.7%)", 0.9973),
+    ]:
+        score_p = get_percentile(abs_errors, p)
+        q_p = get_percentile(q_errors, p)
+        print(f"{label:<30} | {score_p:>38.2f} | {q_p:>38.6f}")
+
+    print("=" * W)
+
+    # Detailed Top 5 Offenders
+    def print_top(title_text, key, col_name, fmt, is_pct=False):
+        print(f"\n>>> {title_text}")
+        top = sorted(data, key=lambda x: x[key], reverse=True)[:5]
+        print(
+            f"{col_name:>12} | {ref_name + ' Score':>10} | {cmp_name + ' Score':>10} | {ref_name + ' Q':>8} | {cmp_name + ' Q':>8} | {'FEN'}"
         )
+        print("-" * W)
+        for d in top:
+            v = d[key] * 100 if is_pct else d[key]
+            v_str = f"{v:{fmt}}" + ("%" if is_pct else "")
+            print(
+                f"{v_str:>12} | {d['ref']:>10.2f} | {d['cmp']:>10.2f} | {d['q_ref']:>8.4f} | {d['q_cmp']:>8.4f} | {d['fen']}"
+            )
+
+    print_top("TOP 5 LARGEST ABSOLUTE ERRORS", "abs_err", "Abs Err", "12.2f")
+    print_top(
+        "TOP 5 LARGEST RELATIVE ERRORS", "rel_err", "Rel Err", "11.2f", is_pct=True
     )
-    print("Min difference: {}".format(min_diff))
-    print("Max difference: {}".format(max_diff))
+    print_top("TOP 5 LARGEST Q ERRORS", "q_err", "Q Err", "12.6f")
+    print("\n" + "=" * W + "\n")
 
 
 def eval_engine_batch(engine_path, net_path, fens):
+    if not fens:
+        return []
     engine = subprocess.Popen(
         [engine_path],
         stdin=subprocess.PIPE,
@@ -142,7 +268,13 @@ def eval_engine_batch(engine_path, net_path, fens):
     query = "\n".join(parts)
     out = engine.communicate(input=query)[0]
     evals = re.findall(re_nnue_eval, out)
-    return [int(float(v) * 208) for v in evals]
+    if len(evals) != len(fens):
+        raise Exception(
+            "number of evals returned by the engine doesn't match the number of fens. Got {} evals and {} fens. Output was:\n{}".format(
+                len(evals), len(fens), out
+            )
+        )
+    return [int(v) for v in evals]
 
 
 def filter_fens(fens):
@@ -156,54 +288,79 @@ def filter_fens(fens):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="")
-    parser.add_argument("--net", type=str, help="path to a .nnue net")
-    parser.add_argument("--engine", type=str, help="path to stockfish")
-    parser.add_argument("--data", type=str, help="path to a .bin or .binpack dataset")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        help="Optional checkpoint (used instead of nnue for local eval)",
-    )
-    parser.add_argument(
-        "--count", type=int, default=100, help="number of datapoints to process"
-    )
-    parser.add_argument("--l1", type=int, default=ModelConfig().L1)
-    add_feature_args(parser)
-    args = parser.parse_args()
+    args = tyro.cli(CliConfig)
 
-    batch_size = 1000
+    cross_check_config = args.cross_check_config
+    nnue_lightning_config = args.nnue_lightning_config
 
-    feature_set = get_feature_set_from_name(args.features)
-    if args.checkpoint:
-        model = NNUE.load_from_checkpoint(
-            args.checkpoint, feature_set=feature_set, config=ModelConfig(L1=args.l1)
+    batch_size = 1024
+
+    ckpt_model = None
+    if cross_check_config.checkpoint:
+        ckpt = M.NNUE.load_from_checkpoint(
+            cross_check_config.checkpoint,
+            config=nnue_lightning_config,
         )
-    else:
-        model = read_model(args.net, feature_set, ModelConfig(L1=args.l1))
-    model.eval()
-    fen_batch_provider = make_fen_batch_provider(args.data, batch_size)
+        ckpt.to(cross_check_config.device)
+        ckpt.eval()
+        # --checkpoint - returns a Lightning NNUE wrapping a NNUEModel
+        ckpt_model = ckpt.model
 
-    model_evals = []
+    nnue = read_model(
+        cross_check_config.net,
+        config=nnue_lightning_config,
+    )
+    nnue.to(cross_check_config.device)
+    nnue.eval()
+    # --net - returns the NNUEModel directly
+    nnue_model = nnue
+
+    input_feature_name = nnue_model.input_feature_name
+    fen_batch_provider = make_fen_batch_provider(cross_check_config.data, batch_size)
+
+    ckpt_evals = []
+    ckpt_quantized_evals = []
+    nnue_evals = []
+    nnue_quantized_evals = []
     engine_evals = []
+    all_fens = []
 
     done = 0
     print("Processed {} positions.".format(done))
-    while done < args.count:
+    while done < cross_check_config.count:
         fens = filter_fens(next(fen_batch_provider))
+        all_fens += fens
 
         b = data_loader.get_sparse_batch_from_fens(
-            feature_set.name, fens, [0] * len(fens), [1] * len(fens), [0] * len(fens)
+            input_feature_name, fens, [0] * len(fens), [1] * len(fens), [0] * len(fens)
         )
-        model_evals += eval_model_batch(model, b)
+        if ckpt_model:
+            ckpt_evals += eval_model_batch(ckpt_model, b, cross_check_config.device, False)
+            ckpt_quantized_evals += eval_model_batch(ckpt_model, b, cross_check_config.device, True)
+
+        nnue_evals += eval_model_batch(nnue_model, b, cross_check_config.device, False)
+        nnue_quantized_evals += eval_model_batch(nnue_model, b, cross_check_config.device, True)
         data_loader.destroy_sparse_batch(b)
 
-        engine_evals += eval_engine_batch(args.engine, args.net, fens)
+        engine_evals += eval_engine_batch(
+            cross_check_config.engine,
+            cross_check_config.net,
+            fens,
+        )
 
         done += len(fens)
         print("Processed {} positions.".format(done))
 
-    compute_correlation(engine_evals, model_evals)
+    if ckpt_model:
+        compute_correlation(ckpt_evals, nnue_evals, all_fens, "CKPT VS NNUE", "CKPT", "NNUE")
+        compute_correlation(ckpt_quantized_evals, nnue_quantized_evals, all_fens, "CKPT (Q) VS NNUE (Q)", "CKPT (Q)", "NNUE (Q)")
+        compute_correlation(ckpt_evals, engine_evals, all_fens, "CKPT VS SF", "CKPT", "SF")
+        compute_correlation(ckpt_quantized_evals, engine_evals, all_fens, "QUANTIZED CKPT VS SF", "CKPT (Q)", "SF")
+        compute_correlation(nnue_evals, engine_evals, all_fens, "NNUE VS SF", "NNUE", "SF")
+        compute_correlation(nnue_quantized_evals, engine_evals, all_fens, "QUANTIZED NNUE VS SF", "NNUE (Q)", "SF")
+    else:
+        compute_correlation(nnue_evals, engine_evals, all_fens, "NNUE VS SF", "NNUE", "SF")
+        compute_correlation(nnue_quantized_evals, engine_evals, all_fens, "QUANTIZED NNUE VS SF", "NNUE (Q)", "SF")
 
 
 if __name__ == "__main__":
